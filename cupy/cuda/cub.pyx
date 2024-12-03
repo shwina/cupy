@@ -6,18 +6,19 @@ from cpython cimport sequence
 from libc.stdint cimport intptr_t
 
 from cupy_backends.cuda.api cimport runtime
-from cupy._core.core cimport _internal_ascontiguousarray
+from cupy._core.core cimport _internal_ascontiguousarray, _ndarray_init
 from cupy._core.internal cimport _contig_axes, is_in
 from cupy.cuda cimport common
 from cupy.cuda cimport device
 from cupy.cuda cimport memory
 from cupy.cuda cimport stream
+from cupy.cuda.cub_reduction_funcs import add
 
 import cupy
 import cupy._core as _core
 from cupy.cuda import memory as _memory
 import numpy
-
+import cuda.parallel.experimental as cudax
 
 ###############################################################################
 # Const
@@ -135,77 +136,16 @@ cpdef Py_ssize_t _preprocess_array(tuple arr_shape, tuple reduce_axis,
     return contiguous_size
 
 
-def device_reduce(_ndarray_base x, op, tuple reduce_axis, tuple out_axis,
-                  out=None, bint keepdims=False):
-    cdef _ndarray_base y
-    cdef memory.MemoryPointer ws
-    cdef int dtype_id, ndim_out, kv_bytes, x_size, op_code
-    cdef size_t ws_size
-    cdef void *x_ptr
-    cdef void *y_ptr
-    cdef void *ws_ptr
-    cdef Stream_t s
-    cdef tuple out_shape
-
-    if keepdims:
-        out_shape = _get_output_shape(x, out_axis, keepdims)
-        ndim_out = len(out_shape)
-    else:
-        ndim_out = 0
-    reduce_shape = _get_output_shape(x, reduce_axis, False)
-
-    if out is not None and out.ndim != ndim_out:
-        raise ValueError(
-            'output parameter for reduction operation has the wrong number of '
-            'dimensions')
-    if op not in (CUPY_CUB_SUM, CUPY_CUB_PROD, CUPY_CUB_MIN, CUPY_CUB_MAX,
-                  CUPY_CUB_ARGMIN, CUPY_CUB_ARGMAX):
-        raise ValueError('only CUPY_CUB_SUM, CUPY_CUB_PROD, CUPY_CUB_MIN, '
-                         'CUPY_CUB_MAX, CUPY_CUB_ARGMIN, and CUPY_CUB_ARGMAX '
-                         'are supported.')
-    if op not in (CUPY_CUB_SUM, CUPY_CUB_PROD) and is_in(reduce_shape, 0):
-        raise ValueError('zero-size array to reduction operation {} which has '
-                         'no identity'.format(op.name))
-    x = _internal_ascontiguousarray(x)
-
-    if op in (CUPY_CUB_SUM, CUPY_CUB_PROD, CUPY_CUB_MIN, CUPY_CUB_MAX):
-        y = _core.ndarray((), x.dtype)
-    else:  # argmin and argmax
-        # cub::KeyValuePair has 1 int + 1 arbitrary type
-        # Note that:
-        # - The key may be padded to make the value aligned.
-        # - Unlike a regular structure, thrust::complex<T> is aligned to the
-        #   twice of the size of T.
-        if x.dtype.char in 'FD':
-            kv_bytes = x.dtype.alignment * 2 + x.dtype.itemsize
-        else:
-            kv_bytes = max(4, x.dtype.alignment) + x.dtype.itemsize
-        y = _core.ndarray((kv_bytes,), numpy.int8)
-    x_ptr = <void *>x.data.ptr
-    y_ptr = <void *>y.data.ptr
-    dtype_id = common._get_dtype_id(x.dtype)
-    s = <Stream_t>stream.get_current_stream_ptr()
-    x_size = <int>x.size
-    ws_size = cub_device_reduce_get_workspace_size(x_ptr, y_ptr, x.size, s,
-                                                   op, dtype_id)
-    ws = memory.alloc(ws_size)
-    ws_ptr = <void *>ws.ptr
-    op_code = <int>op
-    with nogil:
-        cub_device_reduce(ws_ptr, ws_size, x_ptr, y_ptr, x_size, s, op_code,
-                          dtype_id)
-    if op in (CUPY_CUB_ARGMIN, CUPY_CUB_ARGMAX):
-        # get key from KeyValuePair: need to reinterpret the first 4 bytes
-        # and then cast it
-        y = y[0:4].view(numpy.int32).astype(numpy.int64)[0]
-        y = y.reshape(())
-
-    if keepdims:
-        y = y.reshape(out_shape)
-    if out is not None:
-        cupy._core.elementwise_copy(y, out)
-        y = out
-    return y
+def device_reduce(_ndarray_base x, op, tuple reduce_axis, tuple out_axis, out=None, bint keepdims=False):
+    assert op == CUPY_CUB_SUM
+    if out is None:
+        out = _ndarray_init(cupy.ndarray, (1,), x.dtype, None)
+    h_init = numpy.asarray(0, x.dtype)
+    reduce_into = cudax.reduce_into(x, out, add, h_init)
+    temp_storage_bytes = reduce_into(None, x, out, h_init)
+    temp_storage = _ndarray_init(cupy.ndarray, (temp_storage_bytes,), numpy.int8, None)
+    reduce_into(temp_storage, x, out,  h_init)
+    return out
 
 
 def device_segmented_reduce(_ndarray_base x, op, tuple reduce_axis,
@@ -429,8 +369,10 @@ cpdef bint _cub_device_segmented_reduce_axis_compatible(
 
 cdef bint can_use_device_reduce(
         _ndarray_base x, int op, tuple out_axis, dtype=None) except*:
+
     return (
         out_axis is ()
+        and op == CUPY_CUB_SUM  # just for testing
         and _cub_reduce_dtype_compatible(x.dtype, op, dtype)
         and x.size <= 0x7fffffff)  # until we resolve cupy/cupy#3309
 
@@ -553,7 +495,7 @@ cpdef cub_reduction(
 
     is_ok, contiguous_size = can_use_device_segmented_reduce(
         arr, op, reduce_axis, out_axis, dtype, order)
-    if is_ok and contiguous_size > 0:
+    if False and contiguous_size > 0:
         return device_segmented_reduce(arr, op, reduce_axis, out_axis,
                                        out, keepdims, contiguous_size)
     return None
